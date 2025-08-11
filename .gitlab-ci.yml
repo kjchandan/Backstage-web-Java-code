@@ -1,0 +1,154 @@
+stages:
+    - lint
+    - build
+    - test
+    - sonarqube-check
+    - sonarqube-vulnerability-report
+    - dockerize
+    - deploy
+
+# ----------------------------- LINT STAGE -----------------------------
+lint:
+    stage: lint
+    image: maven:3-eclipse-temurin-17
+    script:
+        - echo "Running code linting with checkstyle....."
+        - mvn checkstyle:check
+    allow_failure: true
+    only:
+        - main
+
+# ----------------------------- BUILD STAGE -----------------------------
+build-job:
+    stage: build
+    image: maven:3-eclipse-temurin-17
+    script:
+        - echo "Running build..."
+        - mvn clean package -DskipTests=true
+    artifacts:
+        paths:
+            - target/my-webapp.war
+        expire_in: 1 day
+    only:
+        - main
+
+# ----------------------------- TEST STAGE -----------------------------
+unit-tests:
+    stage: test
+    image: maven:3-eclipse-temurin-17
+    script:
+        - echo "Running unit tests..."
+        - mvn test
+    artifacts:
+        reports:
+            junit: target/surefire-reports/TEST-*.xml
+    only:
+        - main
+
+
+# ---------------------- SONARQUBE ANALYSIS STAGE ----------------------
+sonarqube-check:
+    stage: sonarqube-check
+    image: maven:3-eclipse-temurin-17
+    variables:
+        SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+        GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+    cache:
+        key: "${CI_JOB_NAME}"
+        paths:
+            - .sonar/cache
+    script:
+        - echo "Starting SonarQube scan..." 
+        - mvn verify sonar:sonar
+    allow_failure: true
+    only:
+        - main
+
+# ----------- EXPORT SONARQUBE SECURITY VULNERABILITY REPORT ----------
+sonarqube-vulnerability-report:
+    stage: sonarqube-vulnerability-report
+    script:
+        - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=hariharpanda3_gitlab-poc_2eb50b77-dee9-4ab8-98a0-39f70686ecbe&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+    allow_failure: true
+    only:
+        - main
+    artifacts:
+        expire_in: 1 day
+        reports:
+            sast: gl-sast-sonar-report.json
+    dependencies:
+        - sonarqube-check
+
+# --------------------- DOCKER BUILD & PUSH STAGE ---------------------
+dockerize-application:
+  stage: dockerize
+  image: docker:20.10
+  services:
+    - docker:20.10-dind
+  before_script:
+    - echo "Logging in to GitLab Container Registry..."
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" registry.gitlab.com
+  script:
+    - echo "Copying WAR file..."
+    - cp target/my-webapp.war .
+    - echo "Building Docker image..."
+    - docker build -t registry.gitlab.com/hariharpanda3/gitlab-poc:$CI_COMMIT_SHORT_SHA .
+    - echo "Pushing Docker image..."
+    - docker push registry.gitlab.com/hariharpanda3/gitlab-poc:$CI_COMMIT_SHORT_SHA
+  only:
+    - main
+
+# -------------------------  DEPLOYMENT -----------------------------
+.deploy-application:
+  stage: deploy
+  image:
+    name: amazon/aws-cli
+    entrypoint: [""]
+  before_script:
+    - echo "Downloading kubectl binary..."
+    - curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.30.7/2024-12-12/bin/linux/amd64/kubectl
+    - echo "Downloading kubectl checksum..."
+    - curl -O https://s3.us-west-2.amazonaws.com/amazon-eks/1.30.7/2024-12-12/bin/linux/amd64/kubectl.sha256
+    - echo "Verifying kubectl binary..."
+    - sha256sum -c kubectl.sha256
+    - echo "Making kubectl executable..."
+    - chmod +x ./kubectl
+    - echo "Moving kubectl to bin directory and updating PATH..."
+    - mkdir -p $HOME/bin && cp ./kubectl $HOME/bin/kubectl && export PATH=$HOME/bin:$PATH
+    - echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc
+
+  script:
+    - echo "Configuring AWS credentials..."
+    - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+    - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+    - aws configure set default_region $AWS_DEFAULT_REGION
+
+    - echo "Updating kubeconfig with EKS cluster..."
+    - aws eks update-kubeconfig --region $AWS_DEFAULT_REGION --name my-cluster
+
+    - echo "Creating image pull secret for GitLab Container Registry..."
+    - kubectl create secret docker-registry gitlab-registry-secret \
+        --docker-server=registry.gitlab.com \
+        --docker-username=$CI_REGISTRY_USER \
+        --docker-password=$CI_REGISTRY_PASSWORD \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    - echo "Applying Kubernetes manifests..."
+    - kubectl apply -f Application.yaml
+
+    - echo "Getting pod status..."
+    - kubectl get pod
+
+
+
+
+
+
+
+
+
+
+
+
+
+
